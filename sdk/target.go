@@ -54,6 +54,24 @@ const (
 	// cooldown where out-of-band scaling activities have been triggered.
 	TargetStatusMetaKeyLastEvent = "nomad_autoscaler.last_event"
 
+	// TargetMetaKeyCountCapped is written by a target plugin when it clamps
+	// the requested count to the target's own capacity bounds (for example an
+	// AWS Auto Scaling Group's MinSize/MaxSize). It is distinct from the
+	// policy-layer "nomad_autoscaler.count.capped" key so the two independent
+	// capping layers stay traceable. The value is a bool.
+	TargetMetaKeyCountCapped = "nomad_autoscaler.target.count.capped"
+
+	// TargetMetaKeyCountOriginal stores the count requested by the policy
+	// before target-layer clamping. The value is an int64 within the plugin
+	// process; when ScalingAction.Meta crosses the gRPC boundary it is JSON
+	// encoded, so a consumer on the other side sees a float64. Treat this key
+	// as observability data, not as a strongly typed count.
+	TargetMetaKeyCountOriginal = "nomad_autoscaler.target.count.original"
+
+	// TargetMetaKeyCountReason stores a human-readable explanation of the
+	// target-layer clamping and/or direction decision. The value is a string.
+	TargetMetaKeyCountReason = "nomad_autoscaler.target.count.reason"
+
 	// TargetConfigKeyNamespace is the config key used within horizontal app
 	// scaling to identify the Nomad namespace targeted for autoscaling.
 	TargetConfigKeyNamespace = "Namespace"

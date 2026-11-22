@@ -2,6 +2,7 @@
 
 IMPROVEMENTS:
 * build: Updated to Go 1.27.2 [[GH-1359](https://github.com/hashicorp/nomad-autoscaler/pull/1359)]
+* plugin/target/aws-asg: The plugin now clamps scaling requests to the Auto Scaling Group's own MinSize/MaxSize before calling AWS, adding the previously missing scale-out MaxSize protection. The reusable, cloud-agnostic logic lives in the new `sdk/helper/scalebounds` package with dedicated `nomad_autoscaler.target.count.*` meta keys; requests that resolve to the current capacity return a no-op and no longer trigger cooldown.
 
 ## 0.6.0 (September 28, 2026)
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	hclog "github.com/hashicorp/go-hclog"
@@ -18,6 +19,7 @@ import (
 	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/nomad"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/ptr"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scalebounds"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 )
 
@@ -179,16 +181,31 @@ func (t *TargetPlugin) Scale(action sdk.ScalingAction, config map[string]string)
 		}
 	}
 
-	// The AWS ASG target requires different details depending on which
-	// direction we want to scale. Therefore calculate the direction and the
-	// relevant number so we can correctly perform the AWS work.
-	num, direction := t.calculateDirection(int64(*curASG.DesiredCapacity), action.Count)
+	// Apply the ASG's own MinSize/MaxSize bounds to the strategy request.
+	// This is the authoritative target-layer bound check: scaleOut gets its
+	// missing MaxSize protection here and scaleIn keeps a defensive guard of
+	// its own further down. No extra AWS calls are required; all three values
+	// come from the DescribeAutoScalingGroups response above.
+	requestedCount := action.Count
+	res, err := t.applyTargetBounds(curASG, &action)
+	if err != nil {
+		return fmt.Errorf("failed to apply target bounds: %w", err)
+	}
 
-	switch direction {
-	case "in":
-		err = t.scaleIn(ctx, curASG, num, config)
-	case "out":
-		err = t.scaleOut(ctx, curASG, num)
+	switch {
+	case res.NoOp:
+		t.logger.Info("scaling not required after target bound check",
+			"asg_name", asgName, "current_count", res.Current,
+			"requested_count", requestedCount, "resolved_count", res.Count)
+		return sdk.NewTargetScalingNoOpError(
+			"scaling ASG %s not required: requested count %d resolves to current capacity %d",
+			asgName, requestedCount, res.Count)
+	case res.Direction == sdk.ScaleDirectionDown:
+		// scaleIn expects the number of instances to remove; scaleOut
+		// expects the new absolute desired count.
+		err = t.scaleIn(ctx, curASG, res.Current-res.Count, config)
+	case res.Direction == sdk.ScaleDirectionUp:
+		err = t.scaleOut(ctx, curASG, res.Count)
 	default:
 		t.logger.Info("scaling not required", "asg_name", asgName,
 			"current_count", *curASG.DesiredCapacity, "strategy_count", action.Count)
@@ -261,6 +278,87 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 	return &resp, nil
 }
 
+// applyTargetBounds runs the cloud-agnostic scalebounds rule against the ASG's
+// own MinSize/MaxSize. It records the target-layer decision on the action
+// (independent meta keys and an appended reason) and returns the structured
+// result so Scale can dispatch without touching the *autoscaling.Client. All
+// logic that needs offline testing lives in scalebounds.Apply; this method
+// only translates the AWS *int32 fields.
+func (t *TargetPlugin) applyTargetBounds(asg *types.AutoScalingGroup, action *sdk.ScalingAction) (scalebounds.Result, error) {
+
+	if asg.DesiredCapacity == nil {
+		return scalebounds.Result{}, fmt.Errorf("ASG %s response is missing DesiredCapacity",
+			aws.ToString(asg.AutoScalingGroupName))
+	}
+
+	opts := scalebounds.Options{
+		Current:   int64(*asg.DesiredCapacity),
+		Desired:   action.Count,
+		Direction: action.Direction,
+	}
+	if asg.MinSize != nil {
+		minSize := int64(*asg.MinSize)
+		opts.Min = &minSize
+	}
+	if asg.MaxSize != nil {
+		maxSize := int64(*asg.MaxSize)
+		opts.Max = &maxSize
+	}
+
+	res, err := scalebounds.Apply(opts)
+	if err != nil {
+		return scalebounds.Result{}, err
+	}
+
+	action.Canonicalize()
+
+	if res.Capped {
+		t.logger.Warn("capping scaling count to respect target bounds",
+			"asg_name", aws.ToString(asg.AutoScalingGroupName),
+			"requested_count", action.Count, "capped_count", res.Count,
+			"min_size", asg.MinSize, "max_size", asg.MaxSize,
+			"direction", res.Direction)
+	}
+	if res.DirectionMismatch {
+		t.logger.Warn("scaling action direction disagrees with count-derived direction",
+			"asg_name", aws.ToString(asg.AutoScalingGroupName),
+			"requested_direction", action.Direction, "effective_direction", res.Direction,
+			"current_count", res.Current, "requested_count", action.Count)
+	}
+
+	// Record the target-layer rewrite under dedicated keys. The policy-layer
+	// nomad_autoscaler.count.* keys are untouched, so both layers stay
+	// traceable when each capped the request.
+	action.Meta[sdk.TargetMetaKeyCountOriginal] = action.Count
+	if res.Capped {
+		action.Meta[sdk.TargetMetaKeyCountCapped] = true
+	}
+	if res.Reason != "" {
+		action.Meta[sdk.TargetMetaKeyCountReason] = res.Reason
+		if action.Reason != "" {
+			action.Reason = action.Reason + "; " + res.Reason
+		} else {
+			action.Reason = res.Reason
+		}
+	}
+	action.Count = res.Count
+
+	return res, nil
+}
+
+// calculateDirection compares the current ASG desired count with the strategy
+// desired count and returns the number needed by the downstream scale
+// functions together with a free-form direction string:
+//
+//   - when the strategy wants fewer instances ("in"), it returns the number of
+//     instances to remove (asgDesired minus strategyDesired);
+//   - when it wants more instances ("out"), it returns the new absolute
+//     desired total, not the increment;
+//   - when the counts match it returns (0, "").
+//
+// Scale no longer uses this to decide direction; that decision comes from
+// scalebounds. The helper is retained for its delta semantics and existing
+// tests.
 func (t *TargetPlugin) calculateDirection(asgDesired, strategyDesired int64) (int64, string) {
 
 	if strategyDesired < asgDesired {

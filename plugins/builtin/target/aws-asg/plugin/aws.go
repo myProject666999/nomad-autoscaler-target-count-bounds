@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
 	"github.com/hashicorp/nomad-autoscaler/sdk"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scalebounds"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 	"github.com/hashicorp/nomad/api"
 )
@@ -85,6 +86,10 @@ func (t *TargetPlugin) setupAWSClients(config map[string]string) error {
 
 // scaleOut updates the Auto Scaling Group desired count to match what the
 // Autoscaler has deemed required.
+//
+// Scale has already clamped count to the ASG's MaxSize in applyTargetBounds,
+// so a request reaching here fits within the ASG's int32 bounds and the
+// int32 conversion below cannot silently wrap.
 func (t *TargetPlugin) scaleOut(ctx context.Context, asg *types.AutoScalingGroup, count int64) error {
 
 	// Create a logger for this action to pre-populate useful information we
@@ -147,21 +152,38 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, asg *types.AutoScalingGroup,
 	// would subsequently refuse to terminate. Without this check, the policy's
 	// Min can drift below the ASG's MinSize (e.g. an out-of-band edit) and
 	// nodes get drained but never deleted.
+	//
+	// Scale already performs the authoritative check via applyTargetBounds.
+	// This defensive block stays so scaleIn remains correct and directly
+	// testable on its own; both paths use the same scalebounds rule.
 	if asg.MinSize != nil && asg.DesiredCapacity != nil {
 		desired := int64(*asg.DesiredCapacity)
 		minSize := int64(*asg.MinSize)
-		headroom := desired - minSize
-		if headroom <= 0 {
+
+		// A scale-in can only remove instances down to MinSize. When the ASG is
+		// already at or below MinSize there is no headroom at all.
+		if desired <= minSize {
 			log.Warn("skipping scale-in: ASG is already at or below MinSize",
 				"desired_capacity", desired, "min_size", minSize)
 			return sdk.NewTargetScalingNoOpError("ASG %s is already at or below MinSize (desired=%d, min=%d)",
 				*asg.AutoScalingGroupName, desired, minSize)
 		}
-		if num > headroom {
+
+		res, err := scalebounds.Apply(scalebounds.Options{
+			Current:   desired,
+			Desired:   desired - num,
+			Min:       &minSize,
+			Direction: sdk.ScaleDirectionDown,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to apply ASG MinSize bound: %w", err)
+		}
+		if res.Capped {
+			cappedTo := desired - res.Count
 			log.Warn("capping scale-in to respect ASG MinSize",
-				"requested", num, "capped_to", headroom,
+				"requested", num, "capped_to", cappedTo,
 				"desired_capacity", desired, "min_size", minSize)
-			num = headroom
+			num = cappedTo
 		}
 	}
 
